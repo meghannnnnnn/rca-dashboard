@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="UTF-8">
+  <title>RCA Dashboard – Live Chart (server summary)</title>
+  <style>
+    body { font-family: Arial; margin: 20px; background: #f6f7fb; }
+    .top { display:flex; gap:20px; align-items:flex-start; }
+    .left { flex:1; }
+    .right { width: 420px; }
+    table { width: 100%; border-collapse: collapse; background: #fff; margin-top:12px; }
+    th, td { padding: 8px; border-bottom: 1px solid #ccc; text-align: left; }
+    th { background: #0056b3; color: white; }
+    .summary { margin-bottom: 10px; }
+    .critical { color: red; font-weight: bold; }
+    .warning { color: orange; font-weight: bold; }
+    .ok { color: green; font-weight: bold; }
+    .acked { background: #fff7e6; }
+    .resolved { opacity: 0.6; text-decoration: line-through; }
+    .card { background:#fff; padding:10px; border-radius:6px; box-shadow:0 1px 4px rgba(0,0,0,0.06);}
+    canvas { background: white; border: 1px solid #ddd; padding: 8px; }
+  </style>
+</head>
+<body>
+<h1>RCA Dashboard – Live Chart (server summary)</h1>
+
+<div class="top">
+  <div class="left card">
+    <div class="summary">
+      CRITICAL: <span id="criticalCount" class="critical" th:text="${criticalCount}">0</span> |
+      WARNING: <span id="warningCount" class="warning" th:text="${warningCount}">0</span> |
+      OK: <span id="okCount" class="ok" th:text="${okCount}">0</span>
+    </div>
+
+    <table id="alarmsTable">
+      <thead>
+        <tr>
+          <th>ID</th><th>Host</th><th>Service</th><th>State</th><th>Message</th><th>Time</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="alarmsBody">
+        <tr th:each="a : ${alarms}" th:attr="id='alarm-row-' + ${a.id}" th:classappend="${a.resolved}? 'resolved' : ( ${a.acknowledged}? 'acked' : '' )">
+          <td th:text="${a.id}"></td>
+          <td th:text="${a.host}"></td>
+          <td th:text="${a.service}"></td>
+          <td th:text="${a.state}"></td>
+          <td th:text="${a.message}"></td>
+          <td th:text="${a.timestamp}"></td>
+          <td>
+            <button type="button" th:if="${!a.acknowledged}" th:onclick="|ackAlarm(${a.id})|">Acknowledge</button>
+            <span th:if="${a.acknowledged}">Acked by <b th:text="${a.ackBy}">user</b></span>
+            <button type="button" th:if="${!a.resolved}" th:onclick="|resolveAlarm(${a.id})|">Resolve</button>
+            <span th:if="${a.resolved}">Resolved</span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="right card">
+    <h3>Active Alerts (by state)</h3>
+    <canvas id="stateChart" width="380" height="300"></canvas>
+    <p style="font-size:12px;color:#666">Chart shows current active alarms (not resolved). Updates live.</p>
+  </div>
+</div>
+
+<p><a href="/">Refresh</a></p>
+
+<!-- Chart.js (CDN) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+  // chart variables
+  let stateChart = null;
+  const chartLabels = ['CRITICAL', 'WARNING', 'OK'];
+  const chartColors = ['rgba(220,53,69,0.8)','rgba(255,159,64,0.8)','rgba(40,167,69,0.8)'];
+
+  // fetch initial summary and draw chart
+  async function fetchSummaryAndDraw() {
+    try {
+      const r = await fetch('/api/summary');
+      const json = await r.json();
+      const data = [json.CRITICAL || 0, json.WARNING || 0, json.OK || 0];
+      // update top counts
+      document.getElementById('criticalCount').textContent = data[0];
+      document.getElementById('warningCount').textContent = data[1];
+      document.getElementById('okCount').textContent = data[2];
+
+      const ctx = document.getElementById('stateChart').getContext('2d');
+      if (stateChart) {
+        stateChart.data.datasets[0].data = data;
+        stateChart.update();
+      } else {
+        stateChart = new Chart(ctx, {
+          type: 'bar',
+          data: {
+            labels: chartLabels,
+            datasets: [{
+              label: 'Active alarms',
+              data: data,
+              backgroundColor: chartColors,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              y: { beginAtZero: true, ticks: { precision:0 } }
+            },
+            plugins: { legend: { display: false } }
+          }
+        });
+      }
+    } catch (e) {
+      console.error('Failed to load summary', e);
+    }
+  }
+
+  // native WebSocket logic
+  let ws;
+  const connectWs = () => {
+    const protocol = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const url = protocol + '://' + location.host + '/ws';
+    ws = new WebSocket(url);
+
+    ws.onopen = () => { console.log('WebSocket open:', url); };
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+
+        // server-sent summary message
+        if (payload.type === 'summary') {
+          // payload contains CRITICAL, WARNING, OK ints
+          const data = [payload.CRITICAL || 0, payload.WARNING || 0, payload.OK || 0];
+          if (stateChart) {
+            stateChart.data.datasets[0].data = data;
+            stateChart.update();
+          } else {
+            // chart not ready — ensure initial draw
+            fetchSummaryAndDraw();
+          }
+          document.getElementById('criticalCount').textContent = data[0];
+          document.getElementById('warningCount').textContent = data[1];
+          document.getElementById('okCount').textContent = data[2];
+          return;
+        }
+
+        if (payload.type === 'ack' || payload.type === 'resolve') {
+          // On ack/resolve, server already broadcasted a summary too — so client can ignore fetch
+          const id = payload.id;
+          const row = document.getElementById('alarm-row-' + id);
+          if (row) {
+            if (payload.type === 'ack') row.classList.add('acked');
+            if (payload.type === 'resolve') row.classList.add('resolved');
+          }
+          return;
+        }
+
+        // otherwise assume it's a full alarm object (new alarm)
+        addAlarmRow(payload);
+
+        // the server also sends a summary; but to keep UI snappy increment locally too
+        incrementChartForState(payload.state);
+
+      } catch (e) {
+        console.error('Invalid JSON from ws', e, event.data);
+      }
+    };
+
+    ws.onclose = (ev) => { console.warn('WebSocket closed, reconnecting in 2s', ev); setTimeout(connectWs, 2000); };
+    ws.onerror = (err) => { console.error('WebSocket error', err); ws.close(); };
+  };
+
+  // helper modifies chart dataset for a newly received alarm
+  function incrementChartForState(state) {
+    if (!stateChart) return fetchSummaryAndDraw();
+    const s = (state || '').toUpperCase();
+    const idx = chartLabels.indexOf(s);
+    if (idx >= 0) {
+      stateChart.data.datasets[0].data[idx] = (stateChart.data.datasets[0].data[idx] || 0) + 1;
+      stateChart.update();
+      // update top count numbers
+      if (s === 'CRITICAL') document.getElementById('criticalCount').textContent = stateChart.data.datasets[0].data[idx];
+      if (s === 'WARNING') document.getElementById('warningCount').textContent = stateChart.data.datasets[0].data[idx];
+      if (s === 'OK') document.getElementById('okCount').textContent = stateChart.data.datasets[0].data[idx];
+    } else {
+      // fall back to refreshing full summary
+      fetchSummaryAndDraw();
+    }
+  }
+
+  // UI + WS helper functions (ack/resolve/add row) – kept the same behaviour as before:
+  function addAlarmRow(alarm) {
+    const tbody = document.getElementById('alarmsBody');
+    const hostFilter = document.getElementById('filterHost') ? document.getElementById('filterHost').value.trim().toLowerCase() : '';
+    const stateFilter = document.getElementById('filterState') ? document.getElementById('filterState').value.trim().toLowerCase() : '';
+    if (hostFilter && !(alarm.host || '').toLowerCase().includes(hostFilter)) return;
+    if (stateFilter && !(alarm.state || '').toLowerCase().includes(stateFilter)) return;
+
+    const tr = document.createElement('tr');
+    tr.id = 'alarm-row-' + (alarm.id || '');
+    if (alarm.resolved) tr.classList.add('resolved'); else if (alarm.acknowledged) tr.classList.add('acked');
+
+    tr.innerHTML = 
+      '<td>' + (alarm.id || '') + '</td>' +
+      '<td>' + (alarm.host || '') + '</td>' +
+      '<td>' + (alarm.service || '') + '</td>' +
+      '<td>' + (alarm.state || '') + '</td>' +
+      '<td>' + (alarm.message || '') + '</td>' +
+      '<td>' + (alarm.timestamp || '') + '</td>' +
+      '<td>' +
+        (alarm.acknowledged ? ('Acked by ' + (alarm.ackBy || '')) : ('<button type=\"button\" onclick=\"ackAlarm(' + (alarm.id||'') + ')\">Acknowledge</button>')) +
+        ' ' +
+        (alarm.resolved ? 'Resolved' : ('<button type=\"button\" onclick=\"resolveAlarm(' + (alarm.id||'') + ')\">Resolve</button>')) +
+      '</td>';
+
+    if (tbody.firstChild) tbody.insertBefore(tr, tbody.firstChild); else tbody.appendChild(tr);
+  }
+
+  async function ackAlarm(id) {
+    const user = prompt("Enter your name for acknowledgement (optional):", "meghana");
+    try {
+      await fetch('/api/alarms/' + id + '/ack', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({user: user})
+      });
+    } catch (e) { alert('Ack failed: '+e); }
+  }
+
+  async function resolveAlarm(id) {
+    if (!confirm('Mark this alarm as resolved?')) return;
+    try {
+      await fetch('/api/alarms/' + id + '/resolve', { method: 'POST' });
+    } catch (e) { alert('Resolve failed: '+e); }
+  }
+
+  function applyFilter() {
+    const host = document.getElementById('filterHost') ? document.getElementById('filterHost').value : '';
+    const state = document.getElementById('filterState') ? document.getElementById('filterState').value : '';
+    const params = new URLSearchParams();
+    if (host) params.set('host', host);
+    if (state) params.set('state', state);
+    window.location.search = params.toString();
+  }
+  function clearFilter() {
+    if (document.getElementById('filterHost')) document.getElementById('filterHost').value = '';
+    if (document.getElementById('filterState')) document.getElementById('filterState').value = '';
+    window.location.search = '';
+  }
+
+  connectWs();
+  // ensure chart is always drawn on load
+  fetchSummaryAndDraw();
+</script>
+
+</body>
+</html>
